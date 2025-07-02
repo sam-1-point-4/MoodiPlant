@@ -1,555 +1,355 @@
-/**
- * @file main.cpp
- * @brief Plant Health Monitor using Arduino Nicla Vision and Edge Impulse with Grove RGB LED Matrix.
- *
- * This version primarily adapts the successful camera and Edge Impulse inferencing logic
- * from the provided Arduino IDE .ino file for PlatformIO, and integrates the Grove Seeed
- * LED RGB Matrix Driver v1.1 (MY9221) to display plant health status using pre-defined emojis.
- *
- * It addresses previous build errors, memory constraints, and ensures correct camera operation.
- *
- * The code utilizes an Edge Impulse trained model (Transfer learning MobileNetV2 block with
- * an Anomaly Detection - FOMO AD block) to classify plant leaf images as
- * 'healthy', 'unhealthy', or 'anomaly' (not a plant).
- *
- * Display Output on Grove RGB LED Matrix:
- * - Healthy: Displays a pre-configured SMILE emoji.
- * - Unhealthy: Displays a pre-configured FROWN emoji.
- * - Anomaly: Displays a pre-configured 'X' emoji.
- *
- * Optimized for PlatformIO build on Arduino Nicla Vision Pro.
- */
-
-/* Includes ---------------------------------------------------------------- */
 #include <Arduino.h>
-#include "MoodiPlant_inferencing.h"
-#include "edge-impulse-sdk/dsp/image/image.hpp" // For image processing functions
-#include "camera.h"
-#include "gc2145.h"
-#include <ea_malloc.h> // For memory allocation (used in the .ino example)
+#include <camera.h> // Now properly referenced and understood
+#include <grove_two_rgb_led_matrix.h> // Correctly referenced based on provided header
+#include <MoodiPlant_inferencing.h> // Edge Impulse library
+#include <gc2145.h> // Specific camera sensor library for Nicla Vision Pro
 
-// Corrected include path for the Grove RGB LED Matrix library
-// Based on your screenshot, the main header is likely directly in the library root or src.
-// If problems persist, you might need to find the specific header in the library that defines
-// GroveTwoRGBLedMatrixClass and Emoji_t. Assuming 'grove_two_rgb_led_matrix.h' is the correct one.
-#include <grove_two_rgb_led_matrix.h> 
+// Forward declaration of the specific ImageSensor instance for Nicla Vision Pro.
+// This is crucial! The Camera class constructor requires an ImageSensor object.
+// The Arduino core for Nicla Vision typically defines this extern object.
+// Common options are GC2145_Sensor or HIMAX_HM0360_Sensor.
+// We are assuming GC2145_Sensor here based on common Nicla Vision setups.
+// If your board uses a different sensor (e.g., Himax HM0360), you must change
+// 'GC2145_Sensor' to the correct extern ImageSensor object provided by your
+// Arduino core/camera library (e.g., extern ImageSensor HIMAX_HM0360_Sensor;).
+// Use the correct concrete sensor type as provided by your camera library.
+// For the GC2145 sensor, the class is usually named GC2145.
+extern GC2145 GC2145_Sensor;
 
-/* Constant defines -------------------------------------------------------- */
-#define EI_CAMERA_RAW_FRAME_BUFFER_COLS         320
-#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS         240
-#define EI_CAMERA_RAW_FRAME_BYTE_SIZE           2 // RGB565 is 2 bytes per pixel
+// LED Matrix instance
+// The matrix object is initialized through its constructor globally.
+GroveTwoRGBLedMatrixClass matrix;
 
-/* Edge Impulse ------------------------------------------------------------- */
-// Alignment macro from the .ino file
-#define ALIGN_PTR(p,a)   ((p & (a-1)) ?(((uintptr_t)p + a) & ~(uintptr_t)(a-1)) : p)
+// Camera and inference settings
+#define CONFIDENCE_THRESHOLD 0.6
+#define MONITORING_INTERVAL 3000 // 3 seconds (3000ms) for auto-capture
+#define IMG_WIDTH 96
+#define IMG_HEIGHT 96
+#define BYTES_PER_PIXEL 2 // RGB565 uses 2 bytes per pixel (16 bits)
 
-// Forward declarations from the .ino file structure
-typedef struct {
-    size_t width;
-    size_t height;
-} ei_device_resize_resolutions_t;
+// Global variables
+// Initialize FrameBuffer with desired dimensions and bits per pixel (RGB565 = 16 bits)
+// The constructor for FrameBuffer is (width, height, bpp)
+// Using IMG_WIDTH and IMG_HEIGHT for the framebuffer size for consistency with EI model input.
+FrameBuffer fb(IMG_WIDTH, IMG_HEIGHT, 16); // 16 bpp for RGB565
 
-/* Private variables ------------------------------------------------------- */
-static bool debug_nn = false; // Set this to true to see e.g. features generated from the raw signal
-static bool is_initialised = false;
-// is_ll_initialised is not strictly needed if we manage camera lifecycle centrally in ei_camera_init/deinit
-// static bool is_ll_initialised = false; // low-level camera initialization state
+// Initialize Camera by passing the specific ImageSensor instance (GC2145_Sensor in this case)
+// This resolves the "no matching function for call to 'Camera::Camera()'" error.
+Camera cam(GC2145_Sensor); 
 
-GC2145 galaxyCore;
-Camera cam(galaxyCore);
-FrameBuffer fb; // FrameBuffer instance for camera operations
+static float features[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
 
-/*
-** @brief points to the output of the capture after RGB565 to RGB888 conversion
-** This buffer will hold the image in RGB888 format for Edge Impulse processing.
-*/
-static uint8_t *ei_camera_capture_out = NULL;
+// Simple emoji patterns for 8x8 matrix (as 64-byte arrays)
+// 0 = off, 1 = on (will be rendered white)
+const uint8_t SMILE_PATTERN[64] = {
+    0,0,1,1,1,1,0,0,
+    0,1,0,0,0,0,1,0,
+    1,0,1,0,0,1,0,1,
+    1,0,0,0,0,0,0,1,
+    1,0,1,0,0,1,0,1,
+    1,0,0,1,1,0,0,1,
+    0,1,0,0,0,0,1,0,
+    0,0,1,1,1,1,0,0
+};
 
-/*
-** @brief used to store the raw frame from the camera in RGB565 format
-*/
-static uint8_t *ei_camera_frame_mem; // Raw allocated memory
-static uint8_t *ei_camera_frame_buffer; // 32-byte aligned pointer for actual buffer
+// Adjusted FROWN pattern to be more distinct from smile
+const uint8_t FROWN_PATTERN[64] = {
+    0,0,1,1,1,1,0,0,
+    0,1,0,0,0,0,1,0,
+    1,0,0,1,1,0,0,1, // Eyes closer together
+    1,0,0,0,0,0,0,1,
+    1,0,1,0,0,1,0,1, // Eyebrows/Upper part
+    1,0,1,1,1,1,0,1, // Mouth as inverted curve
+    0,1,0,0,0,0,1,0,
+    0,0,1,1,1,1,0,0
+};
 
-// --- Grove RGB LED Matrix Object ---
-GroveTwoRGBLedMatrixClass matrix; // Instantiate the Grove RGB LED Matrix object
-
-/* Function prototypes ------------------------------------------------------- */
-void ei_printf(const char *format, ...); // For serial output
-bool ei_camera_init(void);
-void ei_camera_deinit(void);
-bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) ; // out_buf is usually NULL
-bool RBG565ToRGB888(uint8_t *src_buf, uint8_t *dst_buf, uint32_t src_len);
-static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr);
-int calculate_resize_dimensions(uint32_t out_width, uint32_t out_height, uint32_t *resize_col_sz, uint32_t *resize_row_sz, bool *do_resize);
-void display_emoji(Emoji_t emoji); // Function to display emojis on the matrix
+const uint8_t CROSS_PATTERN[64] = {
+    1,0,0,0,0,0,0,1,
+    0,1,0,0,0,0,1,0,
+    0,0,1,0,0,1,0,0,
+    0,0,0,1,1,0,0,0,
+    0,0,0,1,1,0,0,0,
+    0,0,1,0,0,1,0,0,
+    0,1,0,0,0,0,1,0,
+    1,0,0,0,0,0,0,1
+};
 
 /**
- * @brief Arduino setup function.
+ * @brief Displays a given 8x8 pixel pattern on the LED matrix.
+ * This function now uses `displayFrames` to send the custom pattern.
+ * It will display the pattern using white pixels for '1' and black for '0'.
+ * @param pattern A pointer to a 64-byte array representing the 8x8 pattern.
  */
-void setup()
-{
-    Serial.begin(115200);
-    // comment out the below line to cancel the wait for USB connection (needed for native USB)
-    while (!Serial); // Wait for serial monitor to connect
-    ei_printf("MoodiPlant - Plant Health Monitor (Grove LED Matrix Version)\n");
-    ei_printf("----------------------------------------------------------\n");
-
-    // Initialize the Grove RGB LED Matrix
-    if (!matrix.begin()) {
-        ei_printf("ERROR: Failed to initialize Grove RGB LED Matrix! Check connections.\n");
-        // Fallback: If matrix fails, flash onboard LED in red (requires LED pins config)
-        pinMode(LEDR, OUTPUT); pinMode(LEDG, OUTPUT); pinMode(LEDB, OUTPUT);
-        analogWrite(LEDR, 0); analogWrite(LEDG, 255); analogWrite(LEDB, 255); // Red
-        while (1); // Halt on critical error
-    }
-    matrix.clear(); // Ensure matrix is clear initially
-    matrix.displayFlashEmoji(MATRIX_EMOJI_SMILE); // Quick test
-    delay(500);
-    matrix.displayFlashEmoji(MATRIX_EMOJI_X); // Quick test
-    delay(500);
-    matrix.clear();
-
-    // Initialize M4 RAM as in the .ino file
-    // Arduino Nicla Vision has 512KB of RAM allocated for M7 core
-    // and additional 244k on the M4 address space.
-    // Allocating 288 kB for M4 RAM. This is crucial for Edge Impulse memory.
-    malloc_addblock((void*)0x30000000, 288 * 1024);
-    ei_printf("M4 RAM block added.\r\n");
-
-    if (ei_camera_init() == false) {
-        ei_printf("Failed to initialize Camera! Please check hardware connection and try again.\r\n");
-        display_emoji(MATRIX_EMOJI_X); // Display 'X' on matrix for camera error
-        while (1); // Halt on critical error
-    } else {
-        ei_printf("Camera initialized successfully.\r\n");
-    }
-
-    if ((EI_CLASSIFIER_INPUT_WIDTH > EI_CAMERA_RAW_FRAME_BUFFER_COLS) || (EI_CLASSIFIER_INPUT_HEIGHT > EI_CAMERA_RAW_FRAME_BUFFER_ROWS)) {
-        ei_printf("ERROR: Edge Impulse model input resolution (%dx%d) is larger than camera raw output (%dx%d).\n",
-                  EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT, EI_CAMERA_RAW_FRAME_BUFFER_COLS, EI_CAMERA_RAW_FRAME_BUFFER_ROWS);
-        display_emoji(MATRIX_EMOJI_X); // Display 'X' for config error
-        while(1);
-    }
-    ei_printf("Edge Impulse model loaded. Input resolution: %dx%d\n", EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT);
-    ei_printf("\nSystem ready. Point camera at a plant leaf.\n");
-    display_emoji(MATRIX_EMOJI_SMILE); // Indicate readiness with a smile
-    delay(1000);
-    matrix.clear();
+void displayPattern(const uint8_t* pattern) {
+    // The displayFrames function expects a uint8_t* buffer, duration, forever_flag, and frames_number.
+    // For a single static pattern, duration_time can be 0 (no explicit duration, will stay until changed)
+    // and forever_flag can be true, with frames_number = 1.
+    // The library's displayFrames will handle the rendering based on the 0/1 values in the pattern.
+    matrix.displayFrames((uint8_t*)pattern, 0, true, 1);
 }
 
 /**
- * @brief Get data and run inferencing
+ * @brief Shows the smile emoji on the LED matrix using the custom pattern.
  */
-void loop()
-{
-    ei_printf("\nStarting inferencing in 2 seconds...\n");
+void showSmile() { displayPattern(SMILE_PATTERN); }
 
-    // Using delay as a simple wait, or ei_sleep if your Edge Impulse library provides it
-    delay(2000);
+/**
+ * @brief Shows the frown emoji on the LED matrix using the custom pattern.
+ */
+void showFrown() { displayPattern(FROWN_PATTERN); }
 
-    ei_printf("Attempting to take photo...\n");
+/**
+ * @brief Shows the cross (X) emoji on the LED matrix using the custom pattern.
+ */
+void showCross() { displayPattern(CROSS_PATTERN); }
 
-    ei::signal_t signal;
-    signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
-    signal.get_data = &ei_camera_get_data; // This will now use ei_camera_capture_out (RGB888)
-
-    // Capture the image and perform necessary conversions/resizing
-    // The out_buf is NULL here, meaning ei_camera_capture_out will be used internally
-    if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, NULL) == false) {
-        ei_printf("ERR: Failed to capture image during ei_camera_capture().\r\n");
-        display_emoji(MATRIX_EMOJI_X);
-        delay(2000);
-        return;
-    }
-    ei_printf("Photo captured successfully. Running classifier...\n");
-
-    // Run the classifier
-    ei_impulse_result_t result = { 0 };
-
-    EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
-    if (err != EI_IMPULSE_OK) {
-        ei_printf("ERR: Failed to run classifier (%d)\n", err);
-        display_emoji(MATRIX_EMOJI_X);
-        delay(2000);
-        return;
-    }
-
-    // print the predictions
-    ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
-                result.timing.dsp, result.timing.classification, result.timing.anomaly);
-
-    bool object_found = false;
-
-#if EI_CLASSIFIER_OBJECT_DETECTION == 1
-    ei_printf("Object detection bounding boxes:\r\n");
-    for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
-        auto bb = result.bounding_boxes[i];
-        if (bb.value == 0) {
-            continue;
-        }
-
-        object_found = true;
-        ei_printf("    %s (%f) [ x: %u, y: %u, width: %u, height: %u ]\r\n",
-                  bb.label, bb.value, bb.x, bb.y, bb.width, bb.height);
-
-        // Display emoji based on detected object label
-        if (strcmp(bb.label, "healthy") == 0) {
-            display_emoji(MATRIX_EMOJI_SMILE);
-            break; // Assuming only one dominant object is needed for display
-        }
-        else if (strcmp(bb.label, "unhealthy") == 0) {
-            display_emoji(MATRIX_EMOJI_FROWN);
-            break;
-        }
-        else if (strcmp(bb.label, "anomaly") == 0) { // Or if high anomaly score
-            display_emoji(MATRIX_EMOJI_X);
-            break;
-        }
-    }
-#else // Classification model
-    ei_printf("Predictions:\r\n");
-    float healthy_score = 0;
-    float unhealthy_score = 0;
-    float anomaly_score = 0;
-
-    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-        ei_printf("    %s: %.5f\r\n", ei_classifier_inferencing_categories[i], result.classification[i].value);
-        if (strcmp(ei_classifier_inferencing_categories[i], "healthy") == 0) {
-            healthy_score = result.classification[i].value;
-        } else if (strcmp(ei_classifier_inferencing_categories[i], "unhealthy") == 0) {
-            unhealthy_score = result.classification[i].value;
-        } else if (strcmp(ei_classifier_inferencing_categories[i], "anomaly") == 0) {
-            anomaly_score = result.classification[i].value;
-        }
-    }
-
-    // Determine the most confident class
-    if (healthy_score > unhealthy_score && healthy_score > anomaly_score) {
-        display_emoji(MATRIX_EMOJI_SMILE);
-        object_found = true;
-    } else if (unhealthy_score > healthy_score && unhealthy_score > anomaly_score) {
-        display_emoji(MATRIX_EMOJI_FROWN);
-        object_found = true;
-    } else if (anomaly_score > healthy_score && anomaly_score > unhealthy_score) {
-        display_emoji(MATRIX_EMOJI_X);
-        object_found = true;
-    } else {
-        // Fallback for inconclusive results
-        ei_printf("    - No clear classification. Displaying Anomaly (X).\n");
-        display_emoji(MATRIX_EMOJI_X);
-    }
-#endif
-
-#if EI_CLASSIFIER_HAS_ANOMALY
-    ei_printf("Anomaly prediction: %.3f\r\n", result.anomaly);
-    // You might want to add logic here to override if anomaly score is very high,
-    // e.g., if (result.anomaly > 0.8) { display_emoji(MATRIX_EMOJI_X); }
-#endif
-
-#if EI_CLASSIFIER_HAS_VISUAL_ANOMALY
-    ei_printf("Visual anomalies:\r\n");
-    for (uint32_t i = 0; i < result.visual_ad_count; i++) {
-        ei_impulse_result_bounding_box_t bb = result.visual_ad_grid_cells[i];
-        if (bb.value == 0) {
-            continue;
-        }
-        ei_printf("    %s (%f) [ x: %u, y: %u, width: %u, height: %u ]\r\n",
-                  bb.label, bb.value, bb.x, bb.y, bb.width, bb.height);
-    }
-#endif
-
-    if (!object_found) {
-        ei_printf("  - No objects detected or primary classification found. Clearing matrix.\n");
-        matrix.clear(); // Clear matrix if nothing specific was found
-    }
-    
-    delay(3000); // Hold the emoji for 3 seconds
-    matrix.clear(); // Clear the matrix before next cycle
-    delay(500); // Small pause before next capture
+/**
+ * @brief Clears the LED matrix using the `stopDisplay()` function from the library.
+ */
+void clearMatrix() {
+    matrix.stopDisplay(); // This command cleans the display
 }
 
 /**
- * @brief Setup image sensor & start streaming
- * This function heavily relies on the logic from your successful .ino file.
- * @retval false if initialisation failed
+ * @brief Converts a 16-bit RGB565 color value to an 8-bit grayscale value.
+ * @param rgb565 The 16-bit RGB565 color.
+ * @return The 8-bit grayscale value.
  */
-bool ei_camera_init(void) {
-    if (is_initialised) {
-        ei_printf("Camera already marked as initialized. Returning true.\r\n");
-        return true;
-    }
+uint8_t rgb565ToGray(uint16_t rgb565) {
+    // Extract R, G, B components and scale to 8-bit
+    uint8_t r = ((rgb565 >> 11) & 0x1F) << 3; // 5-bit Red, scaled to 8-bit
+    uint8_t g = ((rgb565 >> 5) & 0x3F) << 2;  // 6-bit Green, scaled to 8-bit
+    uint8_t b = (rgb565 & 0x1F) << 3;        // 5-bit Blue, scaled to 8-bit
 
-    ei_printf("Attempting cam.begin() with 1 frame buffer...\r\n");
-    // Using 1 frame buffer as in the successful .ino file for memory optimization
-    if (!cam.begin(CAMERA_R320x240, CAMERA_RGB565, 1)) {
-        ei_printf("ERR: cam.begin() failed! This means the camera hardware or low-level driver could not be initialized.\r\n");
-        return false;
-    }
-    ei_printf("cam.begin() successful. Allocating camera frame memory...\r\n");
-
-    // initialize frame buffer for raw RGB565 data from camera
-    ei_camera_frame_mem = (uint8_t *) ei_malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_RAW_FRAME_BYTE_SIZE + 32 /*alignment*/);
-    if(ei_camera_frame_mem == NULL) {
-        ei_printf("ERR: Failed to allocate ei_camera_frame_mem! Check M4 RAM allocation or available memory.\r\n");
-        return false;
-    }
-    ei_printf("ei_camera_frame_mem allocated. Setting frame buffer...\r\n");
-
-    ei_camera_frame_buffer = (uint8_t *)ALIGN_PTR((uintptr_t)ei_camera_frame_mem, 32);
-    fb.setBuffer(ei_camera_frame_buffer); // Set the buffer for the FrameBuffer object
-
-    is_initialised = true;
-    ei_printf("Camera system successfully initialized (is_initialised = true).\r\n");
-
-    return true;
+    // Simple luminance conversion (ITU-R BT.601)
+    return (r * 77 + g * 151 + b * 28) >> 8;
 }
 
 /**
- * @brief Stop streaming of sensor data
+ * @brief Prepares image features from the camera framebuffer for Edge Impulse classification.
+ * It scales and converts the captured RGB565 image to grayscale features.
+ * This version directly accesses the raw pixel buffer from FrameBuffer.
+ * @return 0 on success, non-zero on failure.
  */
-void ei_camera_deinit(void) {
-    if (ei_camera_frame_mem) { // Only free if allocated
-        ei_free(ei_camera_frame_mem);
-        ei_camera_frame_mem = NULL;
-    }
-    ei_camera_frame_buffer = NULL;
-    is_initialised = false;
-}
+int prepareFeatures() {
+    // Get the actual resolution from the Camera object, not the FrameBuffer object
+    uint32_t camWidth = cam.getResolutionWidth();
+    uint32_t camHeight = cam.getResolutionHeight();
+    uint8_t* frameBufferPtr = fb.getBuffer(); // Get pointer to the raw pixel data
 
-/**
- * @brief Capture, rescale and crop image
- * This function is directly from your .ino file, responsible for camera capture,
- * RGB565 to RGB888 conversion, and potential resizing/cropping.
- *
- * @param[in] img_width     width of output image
- * @param[in] img_height    height of output image
- * @param[in] out_buf       pointer to store output image, NULL may be used
- * if ei_camera_capture_out is to be used for processing.
- *
- * @retval false if not initialised, image captured, rescaled or cropped failed
- */
-bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
-    bool do_resize = false;
-    bool do_crop = false;
-
-    // Allocate memory for the RGB888 output buffer that Edge Impulse expects
-    // This buffer will contain the converted and potentially resized image
-    ei_camera_capture_out = (uint8_t*)ea_malloc(img_width * img_height * 3 + 32); // 3 bytes per pixel for RGB888
-    if(ei_camera_capture_out == NULL) {
-        ei_printf("ERR: Failed to allocate ei_camera_capture_out memory.\r\n");
-        return false;
-    }
-    ei_camera_capture_out = (uint8_t *)ALIGN_PTR((uintptr_t)ei_camera_capture_out, 32);
-    ei_printf("Allocated memory for RGB888 capture output.\r\n");
-
-    if (!is_initialised) {
-        ei_printf("ERR: Camera is not initialized when calling ei_camera_capture()!\r\n");
-        ea_free(ei_camera_capture_out); // Free allocated memory on failure
-        ei_camera_capture_out = NULL;
-        return false;
-    }
-    ei_printf("Camera is initialized. Attempting to grab frame...\r\n");
-
-    // Grab the frame into the pre-allocated fb (ei_camera_frame_buffer)
-    int snapshot_response = cam.grabFrame(fb, 1000); // Using 1000ms timeout
-    if (snapshot_response != 0) {
-        ei_printf("ERR: Failed to get snapshot (%d) from cam.grabFrame()! This is where the actual capture failed.\r\r\n", snapshot_response);
-        ea_free(ei_camera_capture_out); // Free allocated memory on failure
-        ei_camera_capture_out = NULL;
-        return false;
-    }
-    ei_printf("Snapshot grabbed successfully. Converting to RGB888...\r\n");
-
-    // Convert the captured RGB565 frame to RGB888
-    bool converted = RBG565ToRGB888(ei_camera_frame_buffer, ei_camera_capture_out, cam.frameSize());
-
-    if(!converted){
-        ei_printf("ERR: Conversion from RGB565 to RGB888 failed!\n");
-        ea_free(ei_camera_capture_out); // Free allocated memory on failure
-        ei_camera_capture_out = NULL;
-        return false;
-    }
-    ei_printf("Conversion to RGB888 successful. Calculating resize dimensions...\r\n");
-
-    uint32_t resize_col_sz;
-    uint32_t resize_row_sz;
-    
-    // Choose resize dimensions based on the Edge Impulse model's input size
-    int res = calculate_resize_dimensions(img_width, img_height, &resize_col_sz, &resize_row_sz, &do_resize);
-    if (res) {
-        ei_printf("ERR: Failed to calculate resize dimensions (%d)\r\n", res);
-        ea_free(ei_camera_capture_out); // Free allocated memory on failure
-        ei_camera_capture_out = NULL;
-        return false;
-    }
-
-    if ((img_width != resize_col_sz) || (img_height != resize_row_sz)) {
-        do_crop = true; // This means a crop/resize operation will occur
-    }
-
-    if (do_resize || do_crop) { // If any resizing or cropping is needed
-        ei_printf("Resizing/cropping image to %lux%lu...\r\n", resize_col_sz, resize_row_sz);
-        // The image::processing::crop_and_interpolate_rgb888 function handles both.
-        // It operates in-place if source and destination buffers are the same.
-        ei::image::processing::crop_and_interpolate_rgb888(
-            ei_camera_capture_out, // Source buffer (RGB888)
-            EI_CAMERA_RAW_FRAME_BUFFER_COLS, // Source width
-            EI_CAMERA_RAW_FRAME_BUFFER_ROWS, // Source height
-            ei_camera_capture_out, // Destination buffer (in-place processing)
-            resize_col_sz, // Target width (EI_CLASSIFIER_INPUT_WIDTH)
-            resize_row_sz // Target height (EI_CLASSIFIER_INPUT_HEIGHT)
-        );
-    }
-    ei_printf("Image processing complete.\r\n");
-    // Note: ei_camera_capture_out is NOT freed here, as it's needed by ei_camera_get_data for inference.
-    // It will be freed later or reused.
-
-    return true;
-}
-
-/**
- * @brief Convert rgb565 data to rgb888
- * @param[in] src_buf The rgb565 data
- * @param     dst_buf The rgb888 data (will be written here)
- * @param     src_len length of rgb565 data in bytes
- */
-bool RBG565ToRGB888(uint8_t *src_buf, uint8_t *dst_buf, uint32_t src_len)
-{
-    uint8_t hb, lb; // High byte, Low byte
-    uint32_t pix_count = src_len / 2; // Each RGB565 pixel is 2 bytes
-
-    for(uint32_t i = 0; i < pix_count; i ++) {
-        hb = *src_buf++; // Read high byte
-        lb = *src_buf++; // Read low byte
-
-        // Convert RGB565 (RRRRRGGG GGGBBBBB) to RGB888 (RRRRRRRR GGGGGGGG BBBBBBBB)
-        // RRRRR -> RRRRR000 (shift left by 3)
-        // GGGGGG -> GGGGGG00 (shift left by 2)
-        // BBBBB -> BBBBB000 (shift left by 3)
-        *dst_buf++ = (hb & 0xF8); // R (top 5 bits of high byte)
-        *dst_buf++ = ((hb & 0x07) << 5) | ((lb & 0xE0) >> 3); // G (bottom 3 bits of high byte + top 3 bits of low byte)
-        *dst_buf++ = (lb & 0x1F) << 3; // B (bottom 5 bits of low byte)
-    }
-    return true;
-}
-
-/**
- * @brief Provides a chunk of the camera image to the Edge Impulse classifier.
- * This function reads from the ei_camera_capture_out (RGB888) buffer.
- */
-static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr)
-{
-    // The offset and length here are in terms of 'pixels' or the flat dimension of the input signal,
-    // where each 'pixel' for Edge Impulse in this context is a single float representing concatenated RGB.
-    
-    // Calculate the byte offset into the RGB888 buffer
-    size_t byte_offset = offset * 3; // Each pixel is 3 bytes (R, G, B)
-    size_t bytes_to_copy = length * 3;
-
-    // Check if the source buffer is valid and has enough data
-    if (ei_camera_capture_out == NULL || (byte_offset + bytes_to_copy) > (EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT * 3)) {
-        ei_printf("ERR: ei_camera_get_data: Invalid buffer access! offset=%zu, length=%zu\n", offset, length);
+    // Ensure framebuffer and camera dimensions are valid before proceeding
+    if (camWidth == 0 || camHeight == 0 || frameBufferPtr == nullptr) {
+        Serial.println("Error: Camera or Framebuffer not ready (zero dimensions or null buffer).");
         return -1; // Indicate error
     }
-
-    for (size_t i = 0; i < length; i++) {
-        uint8_t r = ei_camera_capture_out[byte_offset + (i * 3)];
-        uint8_t g = ei_camera_capture_out[byte_offset + (i * 3) + 1];
-        uint8_t b = ei_camera_capture_out[byte_offset + (i * 3) + 2];
-
-        // Edge Impulse expects concatenated RGB888 as a float for image input
-        out_ptr[i] = (float)((r << 16) | (g << 8) | b);
-    }
     
-    // After the classifier runs, free the allocated RGB888 buffer
-    // This is crucial for memory management on subsequent loops.
-    ea_free(ei_camera_capture_out);
-    ei_camera_capture_out = NULL; // Reset pointer after freeing
-    
-    return 0; // Success
-}
+    // Convert framebuffer to features array
+    for (int y = 0; y < IMG_HEIGHT; y++) {
+        for (int x = 0; x < IMG_WIDTH; x++) {
+            // Scale coordinates from desired IMG_WIDTH/HEIGHT to actual camera resolution
+            // Cast srcX and srcY to uint32_t for comparison to avoid -Wsign-compare warnings
+            int srcX = (x * camWidth) / IMG_WIDTH;
+            int srcY = (y * camHeight) / IMG_HEIGHT;
+            
+            // Ensure source coordinates are within bounds
+            // Using static_cast<uint32_t> to explicitly resolve signed/unsigned comparison warnings.
+            if (static_cast<uint32_t>(srcX) >= camWidth) srcX = camWidth - 1;
+            if (static_cast<uint32_t>(srcY) >= camHeight) srcY = camHeight - 1;
+            
+            // Calculate pixel index in the raw buffer (RGB565 is 2 bytes per pixel)
+            // Pixel data is stored row by row. Each pixel is 2 bytes.
+            uint32_t pixelIndex = (srcY * camWidth + srcX) * BYTES_PER_PIXEL;
 
-/**
- * @brief Determine whether to resize and to which dimension
- * This function is directly from your .ino file.
- *
- * @param[in] out_width     width of output image (EI_CLASSIFIER_INPUT_WIDTH)
- * @param[in] out_height    height of output image (EI_CLASSIFIER_INPUT_HEIGHT)
- * @param[out] resize_col_sz   pointer to frame buffer's column/width value
- * @param[out] resize_row_sz   pointer to frame buffer's rows/height value
- * @param[out] do_resize     returns whether to resize (or not)
- *
- */
-int calculate_resize_dimensions(uint32_t out_width, uint32_t out_height, uint32_t *resize_col_sz, uint32_t *resize_row_sz, bool *do_resize)
-{
-    // These are common camera resolutions supported by the Nicla Vision,
-    // used to determine the intermediate buffer size for efficient cropping/resizing.
-    size_t list_size = 6;
-    const ei_device_resize_resolutions_t list[list_size] = {
-        {64, 64},
-        {96, 96},
-        {160, 120},
-        {160, 160},
-        {320, 240},
-        {640, 480} // Adding 640x480 as it's a common camera output resolution
-    };
-
-    // (default) conditions
-    *resize_col_sz = EI_CAMERA_RAW_FRAME_BUFFER_COLS; // Default to camera's raw resolution
-    *resize_row_sz = EI_CAMERA_RAW_FRAME_BUFFER_ROWS;
-    *do_resize = false; // Assume no resize needed initially
-
-    // Find the smallest resolution from the list that is greater than or equal to the output dimensions
-    for (size_t ix = 0; ix < list_size; ix++) {
-        if ((out_width <= list[ix].width) && (out_height <= list[ix].height)) {
-            *resize_col_sz = list[ix].width;
-            *resize_row_sz = list[ix].height;
-            *do_resize = true;
-            break;
+            // Extract the 16-bit RGB565 pixel value
+            // Assuming little-endian byte order for RGB565: Low byte first, then high byte.
+            uint16_t pixel = (frameBufferPtr[pixelIndex + 1] << 8) | frameBufferPtr[pixelIndex];
+            
+            uint8_t gray = rgb565ToGray(pixel);
+            
+            // Normalize to 0-1 range for Edge Impulse input
+            features[y * IMG_WIDTH + x] = (float)gray / 255.0f;
         }
     }
-    
-    // If the target size is precisely the camera's raw output, no resize is needed.
-    if (!*do_resize && (out_width == EI_CAMERA_RAW_FRAME_BUFFER_COLS) && (out_height == EI_CAMERA_RAW_FRAME_BUFFER_ROWS)) {
-        *do_resize = false; 
-    } 
-    // If we still haven't set do_resize, but the target dimensions are different from raw camera output,
-    // it implies we need to resize directly to the target dimensions.
-    else if (!*do_resize) {
-        *resize_col_sz = out_width;
-        *resize_row_sz = out_height;
-        *do_resize = true;
-        ei_printf("Warning: Target resolution (%lu,%lu) not an exact match in predefined list or raw. Attempting direct resize.\r\n", out_width, out_height);
-    }
-
     return 0;
 }
 
 /**
- * @brief Displays a predefined emoji on the Grove RGB LED Matrix.
- * @param emoji The emoji to display (e.g., MATRIX_EMOJI_SMILE, MATRIX_EMOJI_FROWN, MATRIX_EMOJI_X).
+ * @brief Main function to capture an image, classify it using Edge Impulse,
+ * and display the result on the LED matrix.
  */
-void display_emoji(Emoji_t emoji) {
-    matrix.displayFlashEmoji(emoji);
+void classifyImage() {
+    Serial.println("Capturing image...");
+    
+    // Capture image into the global framebuffer 'fb'
+    if (cam.grabFrame(fb, 3000) == 0) { // 3000ms timeout
+        Serial.println("Failed to capture image. Camera may not be initialized or connected.");
+        showCross(); // Show cross on failure
+        return;
+    }
+    
+    Serial.println("Image captured successfully.");
+    
+    // Prepare features for classification
+    if (prepareFeatures() != 0) {
+        Serial.println("Feature preparation failed.");
+        showCross(); // Show cross on failure
+        return;
+    }
+    
+    // Create signal for Edge Impulse classifier
+    signal_t signal;
+    signal.total_length = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE;
+    signal.get_data = [](size_t offset, size_t length, float *out_ptr) -> int {
+        memcpy(out_ptr, features + offset, length * sizeof(float));
+        return 0; // Indicate success
+    };
+    
+    // Run the Edge Impulse classifier
+    ei_impulse_result_t result = { 0 };
+    EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false); // false for non-debug mode
+    
+    if (res != EI_IMPULSE_OK) {
+        Serial.print("Classification failed: Error code ");
+        Serial.println(res);
+        showCross(); // Show cross on classification error
+        return;
+    }
+    
+    // Find the best prediction (highest confidence)
+    float maxConf = 0.0;
+    int bestIdx = -1;
+    
+    Serial.println("Classification Results:");
+    for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        float conf = result.classification[i].value;
+        Serial.print(result.classification[i].label);
+        Serial.print(": ");
+        Serial.println(conf, 4); // Print confidence with 4 decimal places
+        
+        if (conf > maxConf) {
+            maxConf = conf;
+            bestIdx = i;
+        }
+    }
+    
+    // Display result based on confidence and label
+    if (maxConf < CONFIDENCE_THRESHOLD) {
+        Serial.println("Low confidence prediction. Showing cross.");
+        showCross();
+    } else {
+        String label = String(result.classification[bestIdx].label);
+        Serial.print("Predicted: ");
+        Serial.print(label);
+        Serial.print(" (Confidence: ");
+        Serial.print(maxConf * 100, 2); // Display confidence as percentage with 2 decimal places
+        Serial.println("%)");
+        
+        // Show appropriate emoji based on the predicted label
+        if (label.indexOf("healthy") >= 0 || label.indexOf("good") >= 0) {
+            Serial.println("Condition: Healthy/Good. Showing smile.");
+            showSmile();
+        } else if (label.indexOf("unhealthy") >= 0 || label.indexOf("sick") >= 0) {
+            Serial.println("Condition: Unhealthy/Sick. Showing frown.");
+            showFrown();
+        } else {
+            Serial.println("Condition: Unknown/Anomaly. Showing cross.");
+            showCross();
+        }
+    }
+    
+    Serial.println("--- End of Classification ---");
 }
 
 /**
- * @brief A wrapper around Serial.printf for the Edge Impulse SDK.
+ * @brief Arduino setup function. Initializes serial communication,
+ * LED matrix, and camera.
  */
-void ei_printf(const char *format, ...) {
-    char print_buf[1024] = { 0 }; // Buffer for formatted string
-
-    va_list args;
-    va_start(args, format);
-    int r = vsnprintf(print_buf, sizeof(print_buf), format, args);
-    va_end(args);
-
-    if (r > 0) {
-        Serial.print(print_buf);
+void setup() {
+    Serial.begin(115200); // Start serial communication
+    while (!Serial) delay(10); // Wait for serial port to connect (useful for debugging)
+    
+    Serial.println("Starting Plant Monitor System...");
+    
+    // Initialize LED matrix
+    Serial.println("Attempting to use Grove RGB LED Matrix. (No explicit begin() function)");
+    // The matrix object is initialized via its constructor at global scope.
+    // You can optionally call matrix.scanGroveTwoRGBLedMatrixI2CAddress(); here
+    // if you need to ensure the device is found or its address is re-scanned.
+    // However, it doesn't return a status, so no 'if' check is possible.
+    
+    // Test patterns to confirm matrix is working
+    Serial.println("Testing LED matrix patterns (assuming matrix is connected)...");
+    showSmile(); delay(1000);
+    showFrown(); delay(1000);
+    showCross(); delay(1000);
+    clearMatrix(); delay(500);
+    
+    // Initialize camera
+    Serial.print("Initializing Camera (CAMERA_R320x240, CAMERA_RGB565, 30fps)...");
+    if (cam.begin(CAMERA_R320x240, CAMERA_RGB565, 30)) {
+        Serial.println("Success!");
+    } else {
+        Serial.println("Failed!");
+        Serial.println("ERROR: Camera failed to initialize. Ensure connections are correct.");
+        // If camera fails, show a continuous cross on the matrix to indicate error
+        while (1) {
+            showCross();
+            delay(1000);
+            clearMatrix();
+            delay(1000);
+        }
     }
+    
+    Serial.println("System ready and running!");
+    showSmile(); // Show a smile when system is ready
+    delay(2000);
+    clearMatrix(); // Clear matrix after initial smile
 }
 
-#if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_CAMERA
-#warning "EI_CLASSIFIER_SENSOR is not defined as EI_CLASSIFIER_SENSOR_CAMERA. Ensure your Edge Impulse model is trained for camera input."
-#endif
+/**
+ * @brief Arduino loop function. Periodically captures and classifies images,
+ * and handles serial commands.
+ */
+void loop() {
+    static unsigned long lastCapture = 0; // Stores time of last capture
+
+    // Automatic image capture based on MONITORING_INTERVAL
+    if (millis() - lastCapture >= MONITORING_INTERVAL) {
+        classifyImage(); // Perform image capture and classification
+        lastCapture = millis(); // Update last capture time
+    }
+    
+    // Handle incoming serial commands
+    if (Serial.available()) {
+        String cmd = Serial.readStringUntil('\n'); // Read command until newline
+        cmd.trim();        // Remove leading/trailing whitespace
+        cmd.toLowerCase(); // Convert to lowercase for easier comparison
+        
+        if (cmd == "c" || cmd == "capture") {
+            classifyImage();
+        } else if (cmd == "s" || cmd == "smile") {
+            showSmile();
+        } else if (cmd == "f" || cmd == "frown") {
+            showFrown();
+        } else if (cmd == "x" || cmd == "cross") {
+            showCross();
+        } else if (cmd == "clear") {
+            clearMatrix();
+        } else if (cmd == "help") {
+            Serial.println("Available Commands:");
+            Serial.println("  c or capture: Capture and classify an image.");
+            Serial.println("  s or smile: Display the smile emoji.");
+            Serial.println("  f or frown: Display the frown emoji.");
+            Serial.println("  x or cross: Display the cross emoji.");
+            Serial.println("  clear: Clear the LED matrix.");
+            Serial.println("  help: Show this help message.");
+        } else {
+            Serial.print("Unknown command: '");
+            Serial.print(cmd);
+            Serial.println("'. Type 'help' for available commands.");
+        }
+    }
+    
+    delay(100); // Small delay to prevent busy-waiting on serial or rapid loops
+}
